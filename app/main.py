@@ -1,6 +1,8 @@
 """FastAPI 入口：设备工程测量计算 API。
 
 启动时（lifespan）初始化一次内置单位表；默认监听 8000 端口。
+提供：/calculate（带单位算式）、/resample（测量序列重采样）、
+/repeatability（重复测量重复性统计）。
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .evaluator import Evaluator, Measurement
 from .parser import CalcError, parse_expression
+from .repeatability import repeatability_stats
 from .resample import Sample, resample
 from .units import (
     UnitRegistry,
@@ -126,14 +129,18 @@ MAX_SAMPLES = 100_000
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-class ResampleError(Exception):
-    """重采样请求的语义错误：携带出错字段定位，统一返回 422。"""
+class FieldError(Exception):
+    """携带出错字段定位的语义错误，统一返回 422。"""
 
     def __init__(self, code: str, message: str, field: str):
         super().__init__(message)
         self.code = code
         self.message = message
         self.field = field
+
+
+class ResampleError(FieldError):
+    """/resample 请求的语义错误（兼容旧名称）。"""
 
 
 class DurationIn(BaseModel):
@@ -164,7 +171,7 @@ def _field_error_body(code: str, message: str, field: str) -> dict[str, Any]:
 
 def _finite_fraction(value: float, field: str) -> Fraction:
     if isinstance(value, bool) or not math.isfinite(value):
-        raise ResampleError("INVALID_VALUE", "数值必须是有限数", field)
+        raise FieldError("INVALID_VALUE", "数值必须是有限数", field)
     return Fraction(str(value))
 
 
@@ -283,6 +290,67 @@ def _build_samples(registry: UnitRegistry, req: ResampleRequest):
     return converted, target, step, max_gap
 
 
+# ---------------------------------------------------------------------------
+# /repeatability：重复测量重复性统计
+# ---------------------------------------------------------------------------
+
+MIN_REPEATABILITY_MEASUREMENTS = 2
+MAX_REPEATABILITY_MEASUREMENTS = 100_000
+
+
+class RepeatabilityMeasurementIn(BaseModel):
+    value: float = Field(..., description="测量值（有限数）")
+    unit: str = Field(..., min_length=1, max_length=32, description="测量单位")
+
+
+class RepeatabilityRequest(BaseModel):
+    measurements: list[RepeatabilityMeasurementIn] = Field(
+        ...,
+        min_length=MIN_REPEATABILITY_MEASUREMENTS,
+        max_length=MAX_REPEATABILITY_MEASUREMENTS,
+        description="重复测量序列（至少 2 个），各测量量纲必须一致",
+    )
+    unit: str = Field(..., min_length=1, max_length=32,
+                      description="目标单位：全部测量换算到该单位后做统计")
+
+
+def _build_repeatability_values(registry: UnitRegistry, req: RepeatabilityRequest
+                                ) -> tuple[list[Fraction], Any]:
+    """校验并归一化重复测量：量纲一致、换算到目标单位。"""
+    target = registry.get(req.unit)
+    if target is None:
+        raise FieldError("UNKNOWN_UNIT", f"未知目标单位 {req.unit!r}", "unit")
+
+    values: list[Fraction] = []
+    series_dim: tuple[int, ...] | None = None
+    for i, m in enumerate(req.measurements):
+        unit = registry.get(m.unit)
+        if unit is None:
+            raise FieldError("UNKNOWN_UNIT", f"未知单位 {m.unit!r}",
+                             f"measurements[{i}].unit")
+        if series_dim is None:
+            series_dim = unit.dimension
+        elif not dims_equal(unit.dimension, series_dim):
+            raise FieldError(
+                "DIMENSION_MISMATCH",
+                f"测量量纲不一致：measurements[0] 为 {format_dimension(series_dim)}，"
+                f"而 {m.unit!r} 为 {format_dimension(unit.dimension)}",
+                f"measurements[{i}].unit",
+            )
+        value = _finite_fraction(m.value, f"measurements[{i}].value")
+        values.append(target.from_si(unit.to_si(value)))
+
+    assert series_dim is not None  # measurements 已约束 min_length=2
+    if not dims_equal(target.dimension, series_dim):
+        raise FieldError(
+            "UNIT_DIM_MISMATCH",
+            f"目标单位量纲不匹配：测量为 {format_dimension(series_dim)}，"
+            f"而 {req.unit!r} 为 {format_dimension(target.dimension)}",
+            "unit",
+        )
+    return values, target
+
+
 def create_app() -> FastAPI:
     # 服务就绪前初始化一次内置单位表（lifespan 中仅记录日志）
     registry = build_registry()
@@ -294,8 +362,9 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="设备工程测量计算 API",
         description="解析带数值与单位的工程算式，自动传播量纲、换算兼容单位，并校验非法运算；"
-                    "另提供测量序列重采样（规则网格线性插值 + 缺口保留）。",
-        version="1.1.0",
+                    "另提供测量序列重采样（规则网格线性插值 + 缺口保留）"
+                    "与重复测量重复性统计（均值、样本标准差、极差、变异系数）。",
+        version="1.2.0",
         lifespan=lifespan,
     )
 
@@ -318,7 +387,12 @@ def create_app() -> FastAPI:
                             content=_error_body("INVALID_REQUEST", details, None))
 
     @app.exception_handler(ResampleError)
-    async def resample_error_handler(request: Request, exc: ResampleError):
+    async def resample_error_handler(request: Request, exc: FieldError):
+        return JSONResponse(status_code=422,
+                            content=_field_error_body(exc.code, exc.message, exc.field))
+
+    @app.exception_handler(FieldError)
+    async def field_error_handler(request: Request, exc: FieldError):
         return JSONResponse(status_code=422,
                             content=_field_error_body(exc.code, exc.message, exc.field))
 
@@ -411,6 +485,40 @@ def create_app() -> FastAPI:
             "gaps": gaps,
         }
 
+    @app.post("/repeatability", tags=["repeatability"],
+              summary="重复测量重复性统计", response_model=None)
+    async def repeatability_analysis(req: RepeatabilityRequest) -> dict[str, Any]:
+        """校验各测量量纲一致并统一换算到目标单位，返回重复性统计量。
+
+        * ``mean``：算术平均值；
+        * ``sample_std_dev``：样本标准差（n-1，贝塞尔校正）；
+        * ``range``：极差（最大值 − 最小值）；
+        * ``coefficient_of_variation``：标准差 / |均值| 的无量纲比例，
+          均值为 0 时返回 ``null``。
+        """
+        registry = get_registry()
+        values, target = _build_repeatability_values(registry, req)
+        stats = repeatability_stats(values)
+        if not math.isfinite(stats.std_dev):
+            raise FieldError("NUMERIC_OVERFLOW", "统计结果超出数值范围",
+                             "measurements")
+        try:
+            mean = _fraction_to_float(stats.mean)
+            rng = _fraction_to_float(stats.range)
+        except OverflowError:
+            raise FieldError("NUMERIC_OVERFLOW", "统计结果超出数值范围",
+                             "measurements") from None
+        return {
+            "unit": target.name,
+            "dimension": list(target.dimension),
+            "dimension_text": _dim_text(target.dimension),
+            "count": stats.count,
+            "mean": mean,
+            "sample_std_dev": stats.std_dev,
+            "range": rng,
+            "coefficient_of_variation": stats.coefficient_of_variation,
+        }
+
     @app.get("/units", tags=["meta"], summary="列出内置单位")
     async def list_units() -> dict[str, Any]:
         registry = get_registry()
@@ -436,7 +544,8 @@ def create_app() -> FastAPI:
             "service": "engineering-measurement-calc",
             "version": app.version,
             "docs": "/docs",
-            "endpoints": ["/calculate", "/resample", "/units", "/health"],
+            "endpoints": ["/calculate", "/resample", "/repeatability",
+                          "/units", "/health"],
         }
 
     return app

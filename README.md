@@ -8,6 +8,10 @@
 **固定步长的规则网格**——相邻样本间隔不超过上限时线性插值，
 更大缺口保留为 missing 段（不跨缺口插值），并返回缺口区间与首尾范围。
 
+另提供 **POST /repeatability**：对至少两个带数值与单位的重复测量值，
+校验各测量**量纲一致**后统一换算到目标单位，返回**算术平均值、
+样本标准差（n−1）、极差与变异系数**。
+
 - Web 框架：FastAPI + Uvicorn
 - 数值计算：全程 `fractions.Fraction` 精确有理运算，输出时转 `float`
 - 量纲：7 个 SI 基本量纲整数指数向量 `(L, M, T, I, Θ, N, J)`
@@ -17,6 +21,10 @@
 ## 快速开始
 
 ### Docker Compose（推荐）
+
+镜像构建时按 `requirements.txt` **安装全部依赖**（见 `Dockerfile`）；
+容器启动即运行 `uvicorn app.main:app`，在服务就绪前**完成内置单位表初始化**
+（`app.main:create_app()`，lifespan 记录加载数量），无需额外迁移或初始化命令。
 
 ```bash
 # 构建镜像并后台启动
@@ -224,6 +232,95 @@ curl -s -X POST http://localhost:8000/resample \
 
 网格点数上限为 100 000（步长过小会返回 `INVALID_STEP`），样本数上限为 100 000。
 
+### `POST /repeatability`
+
+对一组**重复测量**做重复性统计：
+
+1. 校验所有测量单位**量纲一致**（否则 `DIMENSION_MISMATCH`，HTTP 422）；
+2. 校验目标单位与测量同量纲（否则 `UNIT_DIM_MISMATCH`）；
+3. 全部测量统一**换算到目标单位**后计算统计量；
+4. 统计量定义：
+   - `mean`：算术平均值，`Σx / n`；
+   - `sample_std_dev`：**样本标准差**，按 **n−1**（贝塞尔校正）计算，
+     `sqrt(Σ(x − mean)² / (n − 1))`；
+   - `range`：极差，`max(x) − min(x)`；
+   - `coefficient_of_variation`：变异系数，`sample_std_dev / |mean|`，
+     为**无量纲比例**（小数，非百分数）；均值为 0 时无定义，返回 `null`。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `measurements` | array | 重复测量序列，**至少 2 个**（上限 100 000）：`{value, unit}` |
+| `measurements[].value` | number | 测量值（有限数） |
+| `measurements[].unit` | string | 测量单位，所有测量量纲必须一致 |
+| `unit` | string | 目标单位，量纲须与各测量一致 |
+
+响应：
+
+| 字段 | 说明 |
+|---|---|
+| `unit` / `dimension` / `dimension_text` | 目标单位及其量纲 |
+| `count` | 参与统计的测量数 n |
+| `mean` | 算术平均值（目标单位） |
+| `sample_std_dev` | 样本标准差（n−1，目标单位） |
+| `range` | 极差 = 最大值 − 最小值（目标单位） |
+| `coefficient_of_variation` | 变异系数（无量纲）；均值为 0 时为 `null` |
+
+#### 示例：混合单位的重复测量
+
+```bash
+curl -s -X POST http://localhost:8000/repeatability \
+  -H 'Content-Type: application/json' \
+  -d '{"measurements":[
+        {"value":10.00,"unit":"mm"},
+        {"value":10.02,"unit":"mm"},
+        {"value":9.98,"unit":"mm"},
+        {"value":1.000,"unit":"cm"}],
+       "unit":"mm"}'
+```
+
+```json
+{"unit":"mm","dimension":[1,0,0,0,0,0,0],"dimension_text":"m",
+ "count":4,"mean":10.0,
+ "sample_std_dev":0.016329931618554522,
+ "range":0.040000000000000924,
+ "coefficient_of_variation":0.0016329931618554523}
+```
+
+（第 4 个测量 `1.000 cm` 自动换算为 `10.00 mm`；均值与极差全程
+`Fraction` 精确计算，输出时转 `float`，故极差末位可能有浮点表示误差。）
+
+#### 示例：零均值时变异系数为 null
+
+```bash
+curl -s -X POST http://localhost:8000/repeatability \
+  -H 'Content-Type: application/json' \
+  -d '{"measurements":[{"value":-1,"unit":"mm"},{"value":1,"unit":"mm"}],
+       "unit":"mm"}'
+```
+
+```json
+{"unit":"mm","dimension":[1,0,0,0,0,0,0],"dimension_text":"m",
+ "count":2,"mean":0.0,"sample_std_dev":1.4142135623730951,
+ "range":2.0,"coefficient_of_variation":null}
+```
+
+温度等仿射单位同样先按绝对量换算（`0 °C` 与 `32 °F` 视为同一点）。
+
+#### 示例：字段定位的 422 错误
+
+与 `/resample` 一致，语义错误统一返回 **HTTP 422**，错误体用
+`error.field` 定位出错字段（如 `measurements[2].unit`、`unit`）：
+
+```json
+{"error":{"code":"DIMENSION_MISMATCH",
+          "message":"测量量纲不一致：measurements[0] 为 m，而 's' 为 s",
+          "field":"measurements[1].unit"}}
+```
+
+少于 2 个测量由请求体校验拒绝（`INVALID_REQUEST`，HTTP 422）。
+
 ### `GET /units`
 
 返回去重后的全部内置单位：名称、量纲向量、量纲文本、别名、
@@ -271,10 +368,13 @@ C, V, Ω, F, S, Wb, T, H, m/s, m^2, m^3 …`），
 | `INVALID_TIMESTAMP` | 422 | `/resample`：时间戳无法解析 |
 | `INVALID_STEP` | 422 | `/resample`：步长非正数或网格点数超限 |
 | `INVALID_MAX_GAP` | 422 | `/resample`：最大可插值间隔非正数 |
+| `NUMERIC_OVERFLOW` | 422 | `/repeatability`：统计结果超出有限数范围 |
 
-`/resample` 的语义错误（含上表后四行及 `UNKNOWN_UNIT`、`UNIT_DIM_MISMATCH`、
-`DIMENSION_MISMATCH`、`INVALID_VALUE`）一律返回 422，并以 `error.field`
-给出字段定位（如 `samples[2].unit`、`step.value`、`max_gap.unit`、`unit`）。
+`/resample` 与 `/repeatability` 的语义错误（`UNKNOWN_UNIT`、
+`UNIT_DIM_MISMATCH`、`DIMENSION_MISMATCH`、`INVALID_VALUE` 等，
+以及上表 `/resample` 专属码）一律返回 422，并以 `error.field`
+给出字段定位（如 `samples[2].unit`、`measurements[1].unit`、
+`step.value`、`max_gap.unit`、`unit`）。
 
 所有表达式错误都返回 `error.position`：`offset`（0 基字符偏移）、
 `length`、`line`、`column`（1 基行列号）。
@@ -296,14 +396,16 @@ C, V, Ω, F, S, Wb, T, H, m/s, m^2, m^3 …`），
 
 ```
 app/
-  units.py       # 量纲向量、单位定义、SI 前缀、内置单位表（启动初始化）
-  parser.py      # 词法分析 + 递归下降解析（AST 携带源码位置）
-  evaluator.py   # 量纲传播、精确求值、非法运算校验
-  resample.py    # 重采样核心：排序、规则网格、线性插值、缺口保留（纯函数）
-  main.py        # FastAPI 路由 / 请求模型 / 错误位置与字段定位
+  units.py          # 量纲向量、单位定义、SI 前缀、内置单位表（启动初始化）
+  parser.py         # 词法分析 + 递归下降解析（AST 携带源码位置）
+  evaluator.py      # 量纲传播、精确求值、非法运算校验
+  resample.py       # 重采样核心：排序、规则网格、线性插值、缺口保留（纯函数）
+  repeatability.py  # 重复性统计：均值、样本标准差(n-1)、极差、变异系数（纯函数）
+  main.py           # FastAPI 路由 / 请求模型 / 错误位置与字段定位
 tests/
-  test_api.py        # /calculate、/units、/health 端到端测试
-  test_resample.py   # /resample 端到端测试
+  test_api.py             # /calculate、/units、/health 端到端测试
+  test_resample.py        # /resample 端到端测试
+  test_repeatability.py   # /repeatability 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt
